@@ -5,7 +5,7 @@
   <description>Large language model inference and chat (ONNX or remote API via libcurl)</description>
   <system_depend check="pkg-config --exists libcurl">libcurl4-openssl-dev</system_depend>
   <system_depend>nlohmann-json3-dev</system_depend>
-  <system_depend>llama.cpp-tools-spacemit</system_depend>
+  <system_depend arch="riscv64">llama.cpp-tools-spacemit</system_depend>
 
   <export>
     <build_type>cmake</build_type>

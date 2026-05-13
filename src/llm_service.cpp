@@ -290,7 +290,7 @@ LLMService::ChatResult LLMService::chat_stream(
                 "LLM is busy processing another request");
             return LLMService::ChatResult{
                 "", "", false,
-                "LLM is busy processing another request"};
+                "LLM is busy processing another request", ""};
         }
         pimpl_->is_processing = true;
         pimpl_->last_output_tokens = -1;

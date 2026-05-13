@@ -34,18 +34,21 @@ public:
         std::string content;
         std::string tool_calls_json;  // assistant's tool calls (JSON array)
         std::string tool_call_id;     // tool reply's corresponding call id
+        std::string reasoning_content;  // assistant reasoning content for APIs that require replay
 
         static ChatMessage System(const std::string& content) {
-            return {Role::SYSTEM, content, "", ""};
+            return {Role::SYSTEM, content, "", "", ""};
         }
         static ChatMessage User(const std::string& content) {
-            return {Role::USER, content, "", ""};
+            return {Role::USER, content, "", "", ""};
         }
-        static ChatMessage Assistant(const std::string& content, const std::string& tool_calls = "") {
-            return {Role::ASSISTANT, content, tool_calls, ""};
+        static ChatMessage Assistant(const std::string& content,
+            const std::string& tool_calls = "",
+            const std::string& reasoning_content = "") {
+            return {Role::ASSISTANT, content, tool_calls, "", reasoning_content};
         }
         static ChatMessage Tool(const std::string& content, const std::string& tool_call_id) {
-            return {Role::TOOL, content, "", tool_call_id};
+            return {Role::TOOL, content, "", tool_call_id, ""};
         }
     };
 
@@ -54,6 +57,7 @@ public:
         std::string tool_calls_json;
         bool cancelled = false;
         std::string error;
+        std::string reasoning_content;
 
         bool HasToolCalls() const {
             return !tool_calls_json.empty() && tool_calls_json != "[]";

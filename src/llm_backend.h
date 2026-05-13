@@ -125,6 +125,7 @@ struct BackendConfig {
         std::string model;
         std::string api_base;
         std::string api_key;
+        int reasoning_budget = -1;
     } openai;
 
     struct {

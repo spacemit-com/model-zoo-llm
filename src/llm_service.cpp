@@ -62,6 +62,7 @@ LLMService::LLMService(
     config.openai.model = model;
     config.openai.api_base = api_base;
     config.openai.api_key = api_key;
+    config.openai.reasoning_budget = -1;
 
     auto backend = LLMBackendFactory::create(config);
     if (!backend) {
@@ -375,6 +376,11 @@ void LLMService::update_api_settings(
     pimpl_->backend->update_config("api_base", api_base);
     pimpl_->backend->update_config("api_key", api_key);
     pimpl_->api_base = api_base;
+}
+
+void LLMService::update_reasoning_budget(int reasoning_budget) {
+    pimpl_->backend->update_config(
+        "reasoning_budget", std::to_string(reasoning_budget));
 }
 
 // =============================================================================

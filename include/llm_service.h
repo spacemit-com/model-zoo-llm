@@ -141,6 +141,7 @@ public:
     void update_prompt(const std::string& new_prompt, int max_tokens = -1);
     void update_model(const std::string& new_model);
     void update_api_settings(const std::string& api_base, const std::string& api_key);
+    void update_reasoning_budget(int reasoning_budget);
 
     // =========================================================================
     // Metrics (LLM-oriented performance indicators)

@@ -211,7 +211,7 @@ EOF
   128
 
 # 上面的步骤可以形成脚本进行测试
-./scrips/bench_llm.sh ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf
+./scripts/bench_llm.sh ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf
 ```
 > 说明：以下性能数据是基于K3平台按照上面步骤的实测数据。性能数据为阶段性信息，当前还在持续优化中，最终性能数据将在正式发布前进行修改，请持续关注文档修订记录。
 

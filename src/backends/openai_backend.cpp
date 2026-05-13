@@ -5,6 +5,7 @@
 
 #include "openai_backend.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +21,84 @@
 namespace spacemit_llm {
 
 #ifdef USE_HTTP_CLIENT
+
+// =============================================================================
+// Reasoning content filtering
+// =============================================================================
+
+static size_t suffix_prefix_len(const std::string& text, const std::string& pattern) {
+    const size_t max_len = std::min(text.size(), pattern.size() - 1);
+    for (size_t len = max_len; len > 0; --len) {
+        if (text.compare(text.size() - len, len, pattern, 0, len) == 0) {
+            return len;
+        }
+    }
+    return 0;
+}
+
+struct ThinkBlockFilter {
+    bool in_think = false;
+    std::string pending;
+
+    std::string filter(const std::string& chunk) {
+        static const std::string kOpen = "<think>";
+        static const std::string kClose = "</think>";
+
+        std::string data = pending + chunk;
+        pending.clear();
+
+        std::string out;
+        size_t pos = 0;
+        while (pos < data.size()) {
+            if (in_think) {
+                size_t close = data.find(kClose, pos);
+                if (close == std::string::npos) {
+                    size_t keep = suffix_prefix_len(data.substr(pos), kClose);
+                    if (keep > 0) {
+                        pending = data.substr(data.size() - keep);
+                    }
+                    return out;
+                }
+                pos = close + kClose.size();
+                in_think = false;
+                continue;
+            }
+
+            size_t open = data.find(kOpen, pos);
+            if (open == std::string::npos) {
+                std::string tail = data.substr(pos);
+                size_t keep = suffix_prefix_len(tail, kOpen);
+                out += tail.substr(0, tail.size() - keep);
+                if (keep > 0) {
+                    pending = tail.substr(tail.size() - keep);
+                }
+                return out;
+            }
+
+            out += data.substr(pos, open - pos);
+            pos = open + kOpen.size();
+            in_think = true;
+        }
+
+        return out;
+    }
+
+    std::string flush() {
+        std::string out;
+        if (!in_think) {
+            out = pending;
+        }
+        pending.clear();
+        return out;
+    }
+};
+
+static std::string strip_think_blocks(const std::string& text) {
+    ThinkBlockFilter filter;
+    std::string out = filter.filter(text);
+    out += filter.flush();
+    return out;
+}
 
 // =============================================================================
 // curl_global_init with call_once
@@ -55,7 +134,21 @@ struct StreamData {
     bool cancelled = false;
     bool finished = false;
     bool content_delivered = false;  // true if any content was passed to callback
+    bool emit_reasoning = true;
+    ThinkBlockFilter think_filter;
 };
+
+static bool EmitStreamContent(StreamData* sd, const std::string& content) {
+    std::string visible = sd->emit_reasoning ? content : sd->think_filter.filter(content);
+    if (visible.empty()) return true;
+    sd->content_delivered = true;
+    return sd->callback(visible, false, "");
+}
+
+static bool FlushStreamContent(StreamData* sd) {
+    if (sd->emit_reasoning) return true;
+    return EmitStreamContent(sd, sd->think_filter.flush());
+}
 
 static size_t StreamWriteCallback(
     void* contents, size_t size, size_t nmemb, StreamData* sd) {
@@ -86,6 +179,10 @@ static size_t StreamWriteCallback(
         }
 
         if (data_line == "[DONE]") {
+            if (!FlushStreamContent(sd)) {
+                sd->cancelled = true;
+                return 0;
+            }
             sd->finished = true;
             sd->callback("", true, "");
             sd->buffer.clear();
@@ -100,23 +197,26 @@ static size_t StreamWriteCallback(
                 !json_chunk["choices"].empty()) {
                 auto& choice = json_chunk["choices"][0];
 
-                // Helper: emit a content string if present
-                auto emit_content = [&sd](const std::string& content) -> bool {
-                    if (content.empty()) return true;
-                    sd->content_delivered = true;
-                    return sd->callback(content, false, "");
-                };
-
-                // Emit any string in delta except "role" (content, reasoning_content, thinking, etc.)
                 if (choice.contains("delta") && choice["delta"].is_object()) {
                     auto& delta = choice["delta"];
-                    for (auto it = delta.begin(); it != delta.end(); ++it) {
-                        if (it.key() == "role") continue;
-                        if (it.value().is_string()) {
-                            std::string s = it.value().get<std::string>();
-                            if (!s.empty() && !emit_content(s)) {
-                                sd->cancelled = true;
-                                return 0;
+                    if (delta.contains("content") &&
+                        !delta["content"].is_null() &&
+                        delta["content"].is_string()) {
+                        std::string s = delta["content"].get<std::string>();
+                        if (!EmitStreamContent(sd, s)) {
+                            sd->cancelled = true;
+                            return 0;
+                        }
+                    }
+                    if (sd->emit_reasoning) {
+                        for (const char* key : {"reasoning_content", "thinking"}) {
+                            if (delta.contains(key) && !delta[key].is_null() &&
+                                delta[key].is_string()) {
+                                std::string s = delta[key].get<std::string>();
+                                if (!EmitStreamContent(sd, s)) {
+                                    sd->cancelled = true;
+                                    return 0;
+                                }
                             }
                         }
                     }
@@ -128,7 +228,7 @@ static size_t StreamWriteCallback(
                     !choice["message"]["content"].is_null() &&
                     choice["message"]["content"].is_string()) {
                     std::string s = choice["message"]["content"].get<std::string>();
-                    if (!emit_content(s)) {
+                    if (!EmitStreamContent(sd, s)) {
                         sd->cancelled = true;
                         return 0;
                     }
@@ -136,6 +236,10 @@ static size_t StreamWriteCallback(
 
                 if (choice.contains("finish_reason") &&
                     !choice["finish_reason"].is_null()) {
+                    if (!FlushStreamContent(sd)) {
+                        sd->cancelled = true;
+                        return 0;
+                    }
                     sd->finished = true;
                     sd->callback("", true, "");
                     sd->buffer.clear();
@@ -182,6 +286,8 @@ struct ChatStreamData {
     std::string error;
     bool cancelled = false;
     bool finished = false;
+    bool emit_reasoning = true;
+    ThinkBlockFilter think_filter;
 
     // Accumulated results
     std::string accumulated_content;
@@ -195,6 +301,18 @@ struct ChatStreamData {
     };
     std::map<int, ToolCallAcc> tool_calls;
 };
+
+static bool EmitChatContent(ChatStreamData* sd, const std::string& content) {
+    std::string visible = sd->emit_reasoning ? content : sd->think_filter.filter(content);
+    if (visible.empty()) return true;
+    sd->accumulated_content += visible;
+    return sd->callback(visible, false, "");
+}
+
+static bool FlushChatContent(ChatStreamData* sd) {
+    if (sd->emit_reasoning) return true;
+    return EmitChatContent(sd, sd->think_filter.flush());
+}
 
 static size_t ChatStreamWriteCallback(
     void* contents, size_t size, size_t nmemb,
@@ -225,6 +343,10 @@ static size_t ChatStreamWriteCallback(
         }
 
         if (data_line == "[DONE]") {
+            if (!FlushChatContent(sd)) {
+                sd->cancelled = true;
+                return 0;
+            }
             sd->finished = true;
             sd->callback("", true, "");
             sd->buffer.clear();
@@ -244,14 +366,12 @@ static size_t ChatStreamWriteCallback(
 
                     // Content
                     if (delta.contains("content") &&
-                        !delta["content"].is_null()) {
+                        !delta["content"].is_null() &&
+                        delta["content"].is_string()) {
                         std::string content =
                             delta["content"].get<std::string>();
                         if (!content.empty()) {
-                            sd->accumulated_content += content;
-                            bool cont = sd->callback(
-                                content, false, "");
-                            if (!cont) {
+                            if (!EmitChatContent(sd, content)) {
                                 sd->cancelled = true;
                                 return 0;
                             }
@@ -259,9 +379,36 @@ static size_t ChatStreamWriteCallback(
                     }
 
                     if (delta.contains("reasoning_content") &&
-                        !delta["reasoning_content"].is_null()) {
-                        sd->accumulated_reasoning_content +=
+                        !delta["reasoning_content"].is_null() &&
+                        delta["reasoning_content"].is_string()) {
+                        std::string reasoning =
                             delta["reasoning_content"].get<std::string>();
+                        if (!reasoning.empty()) {
+                            sd->accumulated_reasoning_content += reasoning;
+                            if (sd->emit_reasoning) {
+                                bool cont = sd->callback(reasoning, false, "");
+                                if (!cont) {
+                                    sd->cancelled = true;
+                                    return 0;
+                                }
+                            }
+                        }
+                    }
+                    if (delta.contains("thinking") &&
+                        !delta["thinking"].is_null() &&
+                        delta["thinking"].is_string()) {
+                        std::string thinking =
+                            delta["thinking"].get<std::string>();
+                        if (!thinking.empty()) {
+                            sd->accumulated_reasoning_content += thinking;
+                            if (sd->emit_reasoning) {
+                                bool cont = sd->callback(thinking, false, "");
+                                if (!cont) {
+                                    sd->cancelled = true;
+                                    return 0;
+                                }
+                            }
+                        }
                     }
 
                     // Tool calls (delta accumulation)
@@ -292,6 +439,10 @@ static size_t ChatStreamWriteCallback(
 
                 if (choice.contains("finish_reason") &&
                     !choice["finish_reason"].is_null()) {
+                    if (!FlushChatContent(sd)) {
+                        sd->cancelled = true;
+                        return 0;
+                    }
                     sd->finished = true;
                     sd->callback("", true, "");
                     sd->buffer.clear();
@@ -349,39 +500,69 @@ static struct curl_slist* make_headers(
 // Helper: build messages JSON array from LLMService::ChatMessage vector
 // =============================================================================
 
+static nlohmann::json message_to_json(const LLMService::ChatMessage& msg) {
+    nlohmann::json m;
+    switch (msg.role) {
+        case LLMService::ChatMessage::Role::SYSTEM:    m["role"] = "system"; break;
+        case LLMService::ChatMessage::Role::USER:      m["role"] = "user"; break;
+        case LLMService::ChatMessage::Role::ASSISTANT: m["role"] = "assistant"; break;
+        case LLMService::ChatMessage::Role::TOOL:      m["role"] = "tool"; break;
+    }
+    bool has_tool_calls = msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
+        !msg.tool_calls_json.empty() && msg.tool_calls_json != "[]";
+    bool has_reasoning = msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
+        !msg.reasoning_content.empty();
+    if (msg.content.empty() && (has_tool_calls || has_reasoning)) {
+        m["content"] = nullptr;
+    } else {
+        m["content"] = msg.content;
+    }
+    if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
+        !msg.reasoning_content.empty()) {
+        m["reasoning_content"] = msg.reasoning_content;
+    }
+
+    // Assistant with tool_calls
+    if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
+        !msg.tool_calls_json.empty()) {
+        try {
+            m["tool_calls"] =
+                nlohmann::json::parse(msg.tool_calls_json);
+        } catch (...) {}
+    }
+
+    // Tool response with tool_call_id
+    if (msg.role == LLMService::ChatMessage::Role::TOOL &&
+        !msg.tool_call_id.empty()) {
+        m["tool_call_id"] = msg.tool_call_id;
+    }
+
+    return m;
+}
+
 static nlohmann::json messages_to_json(
     const std::vector<LLMService::ChatMessage>& messages) {
     nlohmann::json arr = nlohmann::json::array();
-    for (const auto& msg : messages) {
-        nlohmann::json m;
-        switch (msg.role) {
-            case LLMService::ChatMessage::Role::SYSTEM:    m["role"] = "system"; break;
-            case LLMService::ChatMessage::Role::USER:      m["role"] = "user"; break;
-            case LLMService::ChatMessage::Role::ASSISTANT: m["role"] = "assistant"; break;
-            case LLMService::ChatMessage::Role::TOOL:      m["role"] = "tool"; break;
-        }
-        m["content"] = msg.content;
-        if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
-            !msg.reasoning_content.empty()) {
-            m["reasoning_content"] = msg.reasoning_content;
-        }
 
-        // Assistant with tool_calls
-        if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
-            !msg.tool_calls_json.empty()) {
-            try {
-                m["tool_calls"] =
-                    nlohmann::json::parse(msg.tool_calls_json);
-            } catch (...) {}
+    size_t i = 0;
+    std::string merged_system;
+    while (i < messages.size() &&
+            messages[i].role == LLMService::ChatMessage::Role::SYSTEM) {
+        if (messages[i].content.empty()) {
+            ++i;
+            continue;
         }
-
-        // Tool response with tool_call_id
-        if (msg.role == LLMService::ChatMessage::Role::TOOL &&
-            !msg.tool_call_id.empty()) {
-            m["tool_call_id"] = msg.tool_call_id;
+        if (!merged_system.empty()) {
+            merged_system += "\n\n";
         }
-
-        arr.push_back(m);
+        merged_system += messages[i].content;
+        ++i;
+    }
+    if (!merged_system.empty()) {
+        arr.push_back({{"role", "system"}, {"content", merged_system}});
+    }
+    for (; i < messages.size(); ++i) {
+        arr.push_back(message_to_json(messages[i]));
     }
     return arr;
 }
@@ -489,12 +670,22 @@ static void http_post_stream(
                     if (c.contains("message") && c["message"].contains("content") &&
                         !c["message"]["content"].is_null()) {
                         content = c["message"]["content"].get<std::string>();
+                        if (!stream_data.emit_reasoning) {
+                            content = strip_think_blocks(content);
+                        }
                     } else if (c.contains("delta") && c["delta"].is_object()) {
                         for (const char* key : {"content", "reasoning_content", "thinking"}) {
+                            if (!stream_data.emit_reasoning &&
+                                std::string(key) != "content") {
+                                continue;
+                            }
                             if (c["delta"].contains(key) && !c["delta"][key].is_null() &&
                                 c["delta"][key].is_string()) {
                                 content += c["delta"][key].get<std::string>();
                             }
+                        }
+                        if (!stream_data.emit_reasoning) {
+                            content = strip_think_blocks(content);
                         }
                     }
                     if (!content.empty()) {
@@ -628,6 +819,7 @@ struct OpenAIBackend::Impl {
     std::string model;
     std::string api_base;
     std::string api_key;
+    int reasoning_budget = -1;
     bool initialized = false;
 
     std::thread worker_thread;
@@ -654,6 +846,7 @@ OpenAIBackend::OpenAIBackend(const BackendConfig& config)
     pimpl_->model = config.openai.model;
     pimpl_->api_base = config.openai.api_base;
     pimpl_->api_key = config.openai.api_key;
+    pimpl_->reasoning_budget = config.openai.reasoning_budget;
 }
 
 OpenAIBackend::~OpenAIBackend() = default;
@@ -698,8 +891,12 @@ std::string OpenAIBackend::complete(
         url, request.dump(), pimpl_->api_key);
 
     auto json_response = nlohmann::json::parse(response);
-    return json_response["choices"][0]["message"]["content"]
+    std::string content = json_response["choices"][0]["message"]["content"]
         .get<std::string>();
+    if (pimpl_->reasoning_budget == 0) {
+        content = strip_think_blocks(content);
+    }
+    return content;
 #else
     (void)user_text;
     (void)prompt;
@@ -765,6 +962,7 @@ void OpenAIBackend::complete_stream(
     pimpl_->worker_thread = std::thread([this, request, callback]() {
         StreamData stream_data;
         stream_data.callback = callback;
+        stream_data.emit_reasoning = pimpl_->reasoning_budget != 0;
         try {
             std::string url = pimpl_->api_base + "/chat/completions";
             http_post_stream(
@@ -805,8 +1003,12 @@ std::string OpenAIBackend::chat(
         url, request.dump(), pimpl_->api_key);
 
     auto json_response = nlohmann::json::parse(response);
-    return json_response["choices"][0]["message"]["content"]
+    std::string content = json_response["choices"][0]["message"]["content"]
         .get<std::string>();
+    if (pimpl_->reasoning_budget == 0) {
+        content = strip_think_blocks(content);
+    }
+    return content;
 #else
     (void)messages;
     (void)max_tokens;
@@ -849,6 +1051,7 @@ LLMService::ChatResult OpenAIBackend::chat_stream(
 
     ChatStreamData stream_data;
     stream_data.callback = callback;
+    stream_data.emit_reasoning = pimpl_->reasoning_budget != 0;
 
     std::string url = pimpl_->api_base + "/chat/completions";
     return http_post_chat_stream(
@@ -874,6 +1077,8 @@ void OpenAIBackend::update_config(
         pimpl_->api_key = value;
     } else if (key == "model") {
         pimpl_->model = value;
+    } else if (key == "reasoning_budget") {
+        pimpl_->reasoning_budget = std::stoi(value);
     }
 }
 

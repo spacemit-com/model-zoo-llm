@@ -179,11 +179,13 @@ struct ChatStreamData {
         const std::string& chunk, bool is_done,
         const std::string& error)> callback;
     std::string buffer;
+    std::string error;
     bool cancelled = false;
     bool finished = false;
 
     // Accumulated results
     std::string accumulated_content;
+    std::string accumulated_reasoning_content;
 
     struct ToolCallAcc {
         std::string id;
@@ -256,6 +258,12 @@ static size_t ChatStreamWriteCallback(
                         }
                     }
 
+                    if (delta.contains("reasoning_content") &&
+                        !delta["reasoning_content"].is_null()) {
+                        sd->accumulated_reasoning_content +=
+                            delta["reasoning_content"].get<std::string>();
+                    }
+
                     // Tool calls (delta accumulation)
                     if (delta.contains("tool_calls") &&
                         delta["tool_calls"].is_array()) {
@@ -297,6 +305,7 @@ static size_t ChatStreamWriteCallback(
                     ? json_chunk["error"]["message"]
                         .get<std::string>()
                     : "Unknown error";
+                sd->error = error_msg;
                 sd->finished = true;
                 sd->callback("", true, error_msg);
                 sd->buffer.clear();
@@ -352,6 +361,10 @@ static nlohmann::json messages_to_json(
             case LLMService::ChatMessage::Role::TOOL:      m["role"] = "tool"; break;
         }
         m["content"] = msg.content;
+        if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
+            !msg.reasoning_content.empty()) {
+            m["reasoning_content"] = msg.reasoning_content;
+        }
 
         // Assistant with tool_calls
         if (msg.role == LLMService::ChatMessage::Role::ASSISTANT &&
@@ -524,7 +537,7 @@ static LLMService::ChatResult http_post_chat_stream(
     CURL* curl = curl_easy_init();
     if (!curl) {
         stream_data.callback("", true, "Failed to initialize CURL");
-        return LLMService::ChatResult{"", "", false, "Failed to initialize CURL"};
+        return LLMService::ChatResult{"", "", false, "Failed to initialize CURL", ""};
     }
 
     struct curl_slist* headers = make_headers(api_key, true);
@@ -554,13 +567,23 @@ static LLMService::ChatResult http_post_chat_stream(
     // Ensure final callback if not already sent
     if (!stream_data.finished) {
         if (stream_data.cancelled) {
-            stream_data.callback("", true, "cancelled");
+            stream_data.error = "cancelled";
+            stream_data.callback("", true, stream_data.error);
         } else if (res != CURLE_OK) {
-            stream_data.callback("", true,
-                "CURL error: " + std::string(curl_easy_strerror(res)));
+            stream_data.error =
+                "CURL error: " + std::string(curl_easy_strerror(res));
+            stream_data.callback("", true, stream_data.error);
         } else if (response_code != 200) {
-            stream_data.callback("", true,
-                "HTTP error: " + std::to_string(response_code));
+            stream_data.error = "HTTP error: " + std::to_string(response_code);
+            if (!stream_data.buffer.empty()) {
+                std::string body = stream_data.buffer;
+                constexpr size_t kMaxErrorBody = 512;
+                if (body.size() > kMaxErrorBody) {
+                    body = body.substr(0, kMaxErrorBody) + "...";
+                }
+                stream_data.error += ", response: " + body;
+            }
+            stream_data.callback("", true, stream_data.error);
         } else {
             stream_data.callback("", true, "");
         }
@@ -570,12 +593,18 @@ static LLMService::ChatResult http_post_chat_stream(
     LLMService::ChatResult result;
     result.content = stream_data.accumulated_content;
     result.cancelled = stream_data.cancelled;
+    result.error = stream_data.error;
+    result.reasoning_content = stream_data.accumulated_reasoning_content;
 
     if (!stream_data.tool_calls.empty()) {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& [idx, tc] : stream_data.tool_calls) {
+            std::string tool_call_id = tc.id;
+            if (tool_call_id.empty()) {
+                tool_call_id = "call_" + std::to_string(idx);
+            }
             arr.push_back({
-                {"id", tc.id},
+                {"id", tool_call_id},
                 {"type", tc.type.empty() ? "function" : tc.type},
                 {"function", {
                     {"name", tc.name},
@@ -829,7 +858,7 @@ LLMService::ChatResult OpenAIBackend::chat_stream(
     (void)max_tokens;
     (void)tools_json;
     callback("", true, "HTTP client not compiled in");
-    return LLMService::ChatResult{"", "", false, "HTTP client not compiled in"};
+    return LLMService::ChatResult{"", "", false, "HTTP client not compiled in", ""};
 #endif
 }
 

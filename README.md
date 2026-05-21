@@ -62,8 +62,17 @@ llama-cli -m ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf \
 ```
 
 验证性能
+
+性能测试约定在 SDK 根目录执行，并使用 `model/Qwen3-30B-A3B-Instruct-2507-04_0.gguf`。
+
 ```bash
-llama-bench -m ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf -t 8 
+llama-bench \
+  -m model/Qwen3-30B-A3B-Instruct-2507-04_0.gguf \
+  -t 8 \
+  -p 128 \
+  -n 128 \
+  -mmp 0 \
+  -fa 1
 ```
 
 ## 3. 应用开发
@@ -195,37 +204,4 @@ export OPENAI_API_KEY=你的云端key
 
 ## 8. 附录：模型性能
 
- ```bash
-llama-server -m ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf -t 8 --port 8080 &
-
-cat > prompt_128.txt << 'EOF'
-You are a helpful assistant. Please answer the following question in detail.
-Explain the basic concepts of large language models, including tokens, context
-length, and how they generate text. Make the explanation easy to understand.
-EOF
-
-./llm_chat "$(cat prompt_128.txt)" \
-  "http://localhost:8080/v1" \
-  "qwen2.5-0.5b" \
-  "You are a helpful assistant." \
-  128
-
-# 上面的步骤可以形成脚本进行测试
-./scripts/bench_llm.sh ~/.cache/models/llm/qwen2.5-0.5b-instruct-q4_0.gguf
-```
-> 说明：以下性能数据是基于K3平台按照上面步骤的实测数据。性能数据为阶段性信息，当前还在持续优化中，最终性能数据将在正式发布前进行修改，请持续关注文档修订记录。
-
-| 模型                  | 参数量 | 量化参数 | first token latency (ms) | token per second (tokens/s) | E2E latency (s) |
-|-----------------------|--------|----------|--------------------------|-----------------------------|-----------------|
-| Qwen2.5-0.5B-Instruct | 0.5B   | Q4_0     | 184                      | 47.8                        |     2.8         |
-| Qwen2.5-0.5B-Instruct | 0.5B   | Q4_0     | 184                      | 47.8                        |     2.8         |
-| Qwen3-0.6B            | 0.6B   | Q4_K_M   | 250                      | 36.4                        |     3.7         |
-| LFM2.5-1.2B-Instruct  | 1.2B   | Q4_0     | 406                      | 25.4                        |     5.3         |
-| Qwen2.5-1.5B-Instruct | 1.5B   | Q4_0     | 398                      | 20.0                        |     6.8         |
-| Deepseek R1-1.5B      | 1.5B   | Q4_0     | 463                      | 19.8                        |     6.8         |
-| glm-edge-1.5b-chat    | 1.5B   | Q4_0     | 367                      | 21.8                        |     6.2         |
-| Qwen3-1.7B            | 1.7B   | Q8_0     | 635                      | 11.6                        |     11.5        |
-| Qwen2.5-3B-Instruct   | 3B     | Q4_0     | 806                      | 11.6                        |     12.5        |
-| SmallThinker-4B-A0.6B | 4B     | Q4_0     | 345                      | 29.5                        |     4.6         |
-| Qwen3-4B              | 4B     | Q4_K_M   | 1477                     | 7.4                         |     18.5        |
-| Qwen3-30B-A3B         | 30B    | Q4_0     | 1495                     | 10.0                        |     14.0        |
+模型性能数据请参考 [SpacemiT Model Zoo 文档](https://www.spacemit.com/community/document/info?lang=zh&nodepath=ai/compute_stack/ai_compute_stack/modelzoo.md)。

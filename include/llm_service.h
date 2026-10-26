@@ -142,6 +142,14 @@ public:
     void update_model(const std::string& new_model);
     void update_api_settings(const std::string& api_base, const std::string& api_key);
     void update_reasoning_budget(int reasoning_budget);
+    // 合并进每个请求体的 JSON 对象文本，用于服务商专有参数，例如 DeepSeek 关闭推理：
+    // {"thinking": {"type": "disabled"}}。空字符串表示不加；不是 JSON 对象时抛异常。
+    void update_extra_body(const std::string& extra_body_json);
+    // 流式请求在等数据时也约每秒调用一次 check，返回 true 就取消（结果同回调返回 false），
+    // 这样服务端没回数据时也能打断。发请求前设置；check 在请求线程里调用，要线程安全。
+    void set_abort_check(std::function<bool()> check);
+    // 连接或传输中这么多秒没有进展就报错；0 用默认值（连接 30 s、无数据 60 s）。
+    void update_stall_timeout(int seconds);
 
     // =========================================================================
     // Metrics (LLM-oriented performance indicators)

@@ -54,6 +54,7 @@ public:
         const std::string& tools_json = "") override;
 
     void update_config(const std::string& key, const std::string& value) override;
+    void set_abort_check(std::function<bool()> check) override;
     std::string get_backend_name() const override { return "OpenAI API"; }
     bool is_available() const override;
 

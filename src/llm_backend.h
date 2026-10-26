@@ -106,6 +106,8 @@ public:
     }
 
     virtual void update_config(const std::string& /* key */, const std::string& /* value */) {}
+    // 见 LLMService::set_abort_check；不支持的后端忽略
+    virtual void set_abort_check(std::function<bool()> /* check */) {}
     virtual std::string get_backend_name() const = 0;
     virtual bool is_available() const = 0;
 };

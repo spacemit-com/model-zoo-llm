@@ -136,6 +136,7 @@ struct StreamData {
     bool content_delivered = false;  // true if any content was passed to callback
     bool emit_reasoning = true;
     ThinkBlockFilter think_filter;
+    std::function<bool()> abort_check;  // 进度回调里查，没收到数据时也能取消
 };
 
 static bool EmitStreamContent(StreamData* sd, const std::string& content) {
@@ -271,6 +272,7 @@ static size_t StreamWriteCallback(
 static int StreamProgressCallback(
     void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     auto* sd = static_cast<StreamData*>(clientp);
+    if (!sd->cancelled && sd->abort_check && sd->abort_check()) sd->cancelled = true;
     return sd->cancelled ? 1 : 0;
 }
 
@@ -288,6 +290,7 @@ struct ChatStreamData {
     bool finished = false;
     bool emit_reasoning = true;
     ThinkBlockFilter think_filter;
+    std::function<bool()> abort_check;  // 进度回调里查，没收到数据时也能取消
 
     // Accumulated results
     std::string accumulated_content;
@@ -475,6 +478,7 @@ static size_t ChatStreamWriteCallback(
 static int ChatStreamProgressCallback(
     void* clientp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     auto* sd = static_cast<ChatStreamData*>(clientp);
+    if (!sd->cancelled && sd->abort_check && sd->abort_check()) sd->cancelled = true;
     return sd->cancelled ? 1 : 0;
 }
 
@@ -540,6 +544,14 @@ static nlohmann::json message_to_json(const LLMService::ChatMessage& msg) {
     return m;
 }
 
+// 把 extra_body 的字段合并进请求，同名字段以 extra_body 为准。
+static nlohmann::json with_extra_body(const nlohmann::json& request, const std::string& extra_body) {
+    if (extra_body.empty()) return request;
+    nlohmann::json merged = request;
+    merged.update(nlohmann::json::parse(extra_body));
+    return merged;
+}
+
 static nlohmann::json messages_to_json(
     const std::vector<LLMService::ChatMessage>& messages) {
     nlohmann::json arr = nlohmann::json::array();
@@ -571,9 +583,18 @@ static nlohmann::json messages_to_json(
 // HTTP POST (sync)
 // =============================================================================
 
+// stall_timeout_s > 0：连接或传输中这么多秒没有进展就报错；0 用默认的连接 30 s、无数据 60 s
+static void set_timeouts(CURL* curl, int stall_timeout_s) {
+    const long stall = stall_timeout_s > 0 ? stall_timeout_s : 60L;  // NOLINT(runtime/int)
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, std::min(30L, stall));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, stall);
+}
+
 static std::string http_post(
     const std::string& url, const std::string& json_data,
-    const std::string& api_key) {
+    const std::string& api_key, int stall_timeout_s) {
     CURL* curl = curl_easy_init();
     if (!curl) {
         throw std::runtime_error("Failed to initialize CURL");
@@ -587,10 +608,7 @@ static std::string http_post(
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    set_timeouts(curl, stall_timeout_s);
 
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
@@ -622,6 +640,7 @@ static void http_post_stream(
     const std::string& url,
     const std::string& json_data,
     const std::string& api_key,
+    int stall_timeout_s,
     StreamData& stream_data
 ) {
     CURL* curl = curl_easy_init();
@@ -637,10 +656,7 @@ static void http_post_stream(
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &stream_data);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    set_timeouts(curl, stall_timeout_s);
 
     // Enable progress callback for mid-transfer cancellation
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
@@ -723,6 +739,7 @@ static LLMService::ChatResult http_post_chat_stream(
     const std::string& url,
     const std::string& json_data,
     const std::string& api_key,
+    int stall_timeout_s,
     ChatStreamData& stream_data
 ) {
     CURL* curl = curl_easy_init();
@@ -739,10 +756,7 @@ static LLMService::ChatResult http_post_chat_stream(
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
         ChatStreamWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &stream_data);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    set_timeouts(curl, stall_timeout_s);
 
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
         ChatStreamProgressCallback);
@@ -820,6 +834,11 @@ struct OpenAIBackend::Impl {
     std::string api_base;
     std::string api_key;
     int reasoning_budget = -1;
+    // 原样合并进每个请求体的字段（JSON 对象文本），用于服务商专有参数，
+    // 如 DeepSeek 关闭推理：{"thinking": {"type": "disabled"}}。
+    std::string extra_body;
+    int stall_timeout_s = 0;
+    std::function<bool()> abort_check;
     bool initialized = false;
 
     std::thread worker_thread;
@@ -888,7 +907,8 @@ std::string OpenAIBackend::complete(
 
     std::string url = pimpl_->api_base + "/chat/completions";
     std::string response = http_post(
-        url, request.dump(), pimpl_->api_key);
+        url, with_extra_body(request, pimpl_->extra_body).dump(), pimpl_->api_key,
+        pimpl_->stall_timeout_s);
 
     auto json_response = nlohmann::json::parse(response);
     std::string content = json_response["choices"][0]["message"]["content"]
@@ -963,10 +983,12 @@ void OpenAIBackend::complete_stream(
         StreamData stream_data;
         stream_data.callback = callback;
         stream_data.emit_reasoning = pimpl_->reasoning_budget != 0;
+        stream_data.abort_check = pimpl_->abort_check;
         try {
             std::string url = pimpl_->api_base + "/chat/completions";
             http_post_stream(
-                url, request.dump(), pimpl_->api_key, stream_data);
+                url, with_extra_body(request, pimpl_->extra_body).dump(), pimpl_->api_key,
+                pimpl_->stall_timeout_s, stream_data);
         } catch (const std::exception& e) {
             if (!stream_data.finished) {
                 callback("", true, e.what());
@@ -1000,7 +1022,8 @@ std::string OpenAIBackend::chat(
 
     std::string url = pimpl_->api_base + "/chat/completions";
     std::string response = http_post(
-        url, request.dump(), pimpl_->api_key);
+        url, with_extra_body(request, pimpl_->extra_body).dump(), pimpl_->api_key,
+        pimpl_->stall_timeout_s);
 
     auto json_response = nlohmann::json::parse(response);
     std::string content = json_response["choices"][0]["message"]["content"]
@@ -1052,10 +1075,12 @@ LLMService::ChatResult OpenAIBackend::chat_stream(
     ChatStreamData stream_data;
     stream_data.callback = callback;
     stream_data.emit_reasoning = pimpl_->reasoning_budget != 0;
+    stream_data.abort_check = pimpl_->abort_check;
 
     std::string url = pimpl_->api_base + "/chat/completions";
     return http_post_chat_stream(
-        url, request.dump(), pimpl_->api_key, stream_data);
+        url, with_extra_body(request, pimpl_->extra_body).dump(), pimpl_->api_key,
+        pimpl_->stall_timeout_s, stream_data);
 #else
     (void)messages;
     (void)max_tokens;
@@ -1079,7 +1104,20 @@ void OpenAIBackend::update_config(
         pimpl_->model = value;
     } else if (key == "reasoning_budget") {
         pimpl_->reasoning_budget = std::stoi(value);
+    } else if (key == "extra_body") {
+#ifdef USE_HTTP_CLIENT
+        if (!value.empty() && !nlohmann::json::parse(value).is_object()) {
+            throw std::invalid_argument("extra_body must be a JSON object");
+        }
+#endif
+        pimpl_->extra_body = value;
+    } else if (key == "stall_timeout") {
+        pimpl_->stall_timeout_s = std::stoi(value);
     }
+}
+
+void OpenAIBackend::set_abort_check(std::function<bool()> check) {
+    pimpl_->abort_check = std::move(check);
 }
 
 bool OpenAIBackend::is_available() const {
